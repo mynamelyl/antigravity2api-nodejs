@@ -398,6 +398,76 @@ export function buildConfig(jsonConfig) {
 
 const config = buildConfig(jsonConfig);
 
+// 版本更新检查接口
+const VERSION_CHECK_URL = 'https://antigravity-auto-updater-974169037036.us-central1.run.app/releases';
+
+/**
+ * 比较两个语义化版本号
+ * @param {string} a - 版本号 a
+ * @param {string} b - 版本号 b
+ * @returns {number} a > b 返回 1，a < b 返回 -1，相等返回 0
+ */
+function compareVersions(a, b) {
+  const pa = a.split('.').map(Number);
+  const pb = b.split('.').map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const na = pa[i] || 0;
+    const nb = pb[i] || 0;
+    if (na > nb) return 1;
+    if (na < nb) return -1;
+  }
+  return 0;
+}
+
+/**
+ * 检查并更新版本号
+ * 从远程接口获取最新版本，如果有更新则更新 config.json 和内存中的配置
+ */
+export async function checkAndUpdateVersion() {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+
+    const response = await fetch(VERSION_CHECK_URL, { signal: controller.signal });
+    clearTimeout(timeout);
+
+    if (!response.ok) {
+      log.warn(`版本检查请求失败: HTTP ${response.status}`);
+      return;
+    }
+
+    const releases = await response.json();
+    if (!Array.isArray(releases) || releases.length === 0 || !releases[0].version) {
+      log.warn('版本检查返回数据格式异常');
+      return;
+    }
+
+    const latestVersion = releases[0].version;
+    const currentVersion = config.api.ideVersion;
+
+    if (compareVersions(latestVersion, currentVersion) > 0) {
+      log.info(`发现新版本: ${currentVersion} → ${latestVersion}，正在更新配置...`);
+
+      // 更新 config.json
+      saveConfigJson({ api: { version: latestVersion } });
+
+      // 更新内存中的配置
+      config.api.ideVersion = latestVersion;
+      config.api.userAgent = `antigravity/${latestVersion} windows/amd64`;
+
+      log.info(`✓ 版本已更新为 ${latestVersion}`);
+    } else {
+      log.info(`当前版本 ${currentVersion} 已是最新`);
+    }
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      log.warn('版本检查超时，跳过更新');
+    } else {
+      log.warn(`版本检查失败: ${err.message}`);
+    }
+  }
+}
+
 // 显示生成的凭据提示
 displayGeneratedCredentials();
 
