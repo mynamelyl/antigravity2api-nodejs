@@ -56,7 +56,6 @@
       "public/js/**/*",
       "public/assets/**/*",
       "src/bin/**/*",
-      "src/utils/proto/**/*",
       ".env.example",
       "config.json"
     ],
