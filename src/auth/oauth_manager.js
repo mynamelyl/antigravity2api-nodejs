@@ -1,6 +1,5 @@
 import crypto from 'crypto';
 import log from '../utils/logger.js';
-import tokenManager from './token_manager.js';
 import requesterManager from '../utils/requesterManager.js';
 import ProjectIdFetcher from './project_id_fetcher.js';
 import { OAUTH_CONFIG, OAUTH_SCOPES, GEMINICLI_OAUTH_CONFIG, GEMINICLI_OAUTH_SCOPES } from '../constants/oauth.js';
@@ -93,7 +92,7 @@ class OAuthManager {
 	/**
 	 * 使用 ProjectIdFetcher 的新方法进行完整验证
 	 * @param {string} accessToken - 访问令牌
-	 * @returns {Promise<{projectId: string|null, sub: string, hasQuota: boolean, source: string, isActivated: boolean}>}
+	 * @returns {Promise<{projectId: string|null, sub: string, hasQuota: boolean, source: string, isActivated: boolean, credits: number|null}>}
 	 */
 	async validateAccount(accessToken) {
 		const fetcher = new ProjectIdFetcher();
@@ -137,7 +136,13 @@ class OAuthManager {
 			account.hasQuota = validation.hasQuota;
 			account.isActivated = validation.isActivated;
 			
-			log.info(`[${mode}] 账号验证完成: sub=${validation.sub}, source=${validation.source}`);
+			// 保存积分信息（仅 free-tier 以上订阅才有）
+			if (validation.credits !== null && validation.credits !== undefined) {
+				account.credits = validation.credits;
+				log.info(`[${mode}] 账号验证完成: sub=${validation.sub}, source=${validation.source}, credits=${validation.credits}`);
+			} else {
+				log.info(`[${mode}] 账号验证完成: sub=${validation.sub}, source=${validation.source}`);
+			}
 		}
 
 		account.enable = true;

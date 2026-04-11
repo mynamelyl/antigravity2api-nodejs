@@ -534,7 +534,9 @@ class TokenManager {
           enable: token.enable !== false,
           projectId: token.projectId || null,
           email: token.email || null,
-          hasQuota: token.hasQuota !== false
+          hasQuota: token.hasQuota !== false,
+          sub: token.sub || null,
+          credits: token.credits !== null && token.credits !== undefined ? token.credits : null
         };
       });
     } catch (error) {

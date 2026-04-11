@@ -16,7 +16,7 @@ class ProjectIdFetcher {
   /**
    * 完整的账号验证流程（重构版）
    * @param {Object} token - Token 对象
-   * @returns {Promise<{projectId: string|null, sub: string, hasQuota: boolean, source: string, isActivated: boolean}>}
+   * @returns {Promise<{projectId: string|null, sub: string, hasQuota: boolean, source: string, isActivated: boolean, credits: number|null}>}
    */
   async validateAccount(token) {
     const result = {
@@ -24,7 +24,8 @@ class ProjectIdFetcher {
       sub: 'free-tier',
       hasQuota: false,
       source: 'none',
-      isActivated: false
+      isActivated: false,
+      credits: null
     };
 
     // 步骤1: 尝试 loadCodeAssist
@@ -38,8 +39,9 @@ class ProjectIdFetcher {
         result.hasQuota = true;
         result.source = 'loadCodeAssist';
         result.isActivated = true;
+        result.credits = loadResult.credits;
         
-        log.info(`[validateAccount] 场景2/3: 已激活账号，sub=${result.sub}`);
+        log.info(`[validateAccount] 场景2/3: 已激活账号，sub=${result.sub}, credits=${result.credits}`);
         return result;
       }
       
@@ -122,7 +124,7 @@ class ProjectIdFetcher {
   /**
    * 尝试通过 loadCodeAssist 获取 projectId
    * @param {Object} token - Token 对象
-   * @returns {Promise<{projectId: string|null, sub: string, isActivated: boolean}|null>} projectId、sub 和激活状态
+   * @returns {Promise<{projectId: string|null, sub: string, isActivated: boolean, credits: number|null}|null>} projectId、sub、激活状态和积分
    * @private
    */
   async _tryLoadCodeAssist(token) {
@@ -158,10 +160,22 @@ class ProjectIdFetcher {
       const projectId = data.cloudaicompanionProject || null;
       const sub = data.currentTier.id || 'free-tier';
       
+      // 提取积分信息（仅 free-tier 以上订阅才有）
+      let credits = null;
+      if (sub !== 'free-tier' && data?.paidTier?.availableCredits?.[0]?.creditAmount) {
+        try {
+          credits = parseFloat(data.paidTier.availableCredits[0].creditAmount);
+          log.info(`[loadCodeAssist] 获取到积分信息: ${credits}`);
+        } catch (err) {
+          log.warn(`[loadCodeAssist] 解析积分信息失败: ${err.message}`);
+        }
+      }
+      
       return {
         projectId,
         sub,
-        isActivated: true
+        isActivated: true,
+        credits
       };
     }
 
@@ -170,7 +184,8 @@ class ProjectIdFetcher {
     return {
       projectId: null,
       sub: 'free-tier',
-      isActivated: false
+      isActivated: false,
+      credits: null
     };
   }
 
