@@ -96,9 +96,13 @@ class ProjectIdFetcher {
    * @returns {Promise<{projectId: string|undefined, sub: string}>} projectId 和 sub
    */
   async fetchProjectId(token) {
+    let cachedCredits = null;
+
     // 步骤1: 尝试 loadCodeAssist
     try {
       const result = await this._tryLoadCodeAssist(token);
+      // 先缓存积分（即使 projectId 为空，积分信息也可能有效）
+      if (result?.credits != null) cachedCredits = result.credits;
       if (result?.projectId) {
         return result;
       }
@@ -111,13 +115,14 @@ class ProjectIdFetcher {
     try {
       const result = await this._tryOnboardUser(token);
       if (result?.projectId) {
+        if (cachedCredits != null) result.credits = cachedCredits;
         return result;
       }
       log.error('[fetchProjectId] loadCodeAssist 和 onboardUser 均未能获取 projectId');
-      return { projectId: undefined, sub: 'free-tier' };
+      return { projectId: undefined, sub: 'free-tier', credits: cachedCredits };
     } catch (err) {
       log.error(`[fetchProjectId] onboardUser 失败: ${err.message}`);
-      return { projectId: undefined, sub: 'free-tier' };
+      return { projectId: undefined, sub: 'free-tier', credits: cachedCredits };
     }
   }
 
@@ -153,27 +158,32 @@ class ProjectIdFetcher {
     });
 
     const data = response.data;
-    //console.log(JSON.stringify(data,null,2));
+
+    // 无条件提取积分信息
+    let credits = null;
+    // 调试：打印 paidTier 结构，排查积分提取问题
+    if (data?.paidTier) {
+      // log.info(`[loadCodeAssist] paidTier 原始数据: ${JSON.stringify(data.paidTier)}`);
+    }
+    const creditAmount = data?.paidTier?.availableCredits?.[0]?.creditAmount;
+    if (creditAmount != null) {
+      const parsed = Number(creditAmount);
+      if (Number.isFinite(parsed)) {
+        credits = parsed;
+        // log.info(`[loadCodeAssist] 获取到积分信息: ${credits}`);
+      }
+    } else {
+      // log.info(`[loadCodeAssist] 未找到 creditAmount, paidTier 存在: ${!!data?.paidTier}, availableCredits: ${JSON.stringify(data?.paidTier?.availableCredits)}`);
+    }
 
     // 检查是否有 currentTier（表示用户已激活）
     if (data?.currentTier) {
       log.info('[loadCodeAssist] 用户已激活');
       const projectId = data.cloudaicompanionProject || null;
       let sub = data.currentTier.id || 'free-tier';
-      const sub2 = data.paidTier.id;
+      const sub2 = data.paidTier?.id;
       if (sub2){
         sub = sub2;
-      }
-      
-      // 提取积分信息（仅 free-tier 以上订阅才有）
-      let credits = null;
-      if (sub !== 'free-tier' && data?.paidTier?.availableCredits?.[0]?.creditAmount) {
-        try {
-          credits = parseFloat(data.paidTier.availableCredits[0].creditAmount);
-          log.info(`[loadCodeAssist] 获取到积分信息: ${credits}`);
-        } catch (err) {
-          log.warn(`[loadCodeAssist] 解析积分信息失败: ${err.message}`);
-        }
       }
       
       return {
@@ -190,7 +200,7 @@ class ProjectIdFetcher {
       projectId: null,
       sub: 'free-tier',
       isActivated: false,
-      credits: null
+      credits
     };
   }
 
@@ -345,11 +355,13 @@ class ProjectIdFetcher {
     const result = {
       sub: 'free-tier',
       credits: null,
-      isActivated: false
+      isActivated: false,
+      fetched: false
     };
 
     try {
       const loadResult = await this._tryLoadCodeAssist(token);
+      result.fetched = true;
       
       if (loadResult?.isActivated) {
         result.sub = loadResult.sub || 'free-tier';

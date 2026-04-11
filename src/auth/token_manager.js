@@ -39,6 +39,28 @@ class TokenManager {
   }
 
   /**
+   * 规范化 token 对象，确保所有必需字段存在
+   * - sessionId: 每次启动必须新生成（代表 IDE 会话，上游会校验）
+   * - instanceId/deviceId: 有值就保留，缺失或空串才生成
+   * - sub: 有值就保留（后续 fetchProjectId 时上游返回新值会覆盖）
+   * - 布尔字段用 ?? 保留 false 的语义
+   * @param {Object} token - 原始 token 对象
+   * @returns {Object} 规范化后的 token 对象
+   * @private
+   */
+  static _normalizeToken(token) {
+    return {
+      ...token,
+      sessionId: generateSessionId(),
+      instanceId: token.instanceId || generateInstanceId(),
+      deviceId: token.deviceId || randomUUID(),
+      sub: token.sub || 'g1-pro-tier',
+      hasQuota: token.hasQuota ?? true,
+      enable: token.enable ?? true,
+    };
+  }
+
+  /**
    * 初始化
    * @private
    */
@@ -52,19 +74,11 @@ class TokenManager {
       // 2. 清空池并重新加载
       this.pool.clear();
 
-      // 3. 过滤启用的 token 并添加必要属性
-      const enabledTokens = tokenArray
-        .filter(token => token.enable !== false)
-        .map(token => ({
-          ...token,
-          sessionId: generateSessionId(),
-          instanceId: generateInstanceId(),
-          deviceId: randomUUID(),
-          sub: token?.sub || 'g1-pro-tier'
-        }));
+      // 3. 所有 token 都加载进池，启用状态由 TokenPool 单独维护
+      const normalizedTokens = tokenArray.map(TokenManager._normalizeToken);
 
       // 4. 批量添加到池中
-      await this.pool.addAll(enabledTokens);
+      await this.pool.addAll(normalizedTokens);
 
       // 5. 加载轮询策略配置
       this._loadRotationConfig();
@@ -76,20 +90,24 @@ class TokenManager {
 
       // 7. 日志输出
       const poolSize = this.pool.size();
+      const enabledCount = this.pool.getEnabledIds().length;
       if (poolSize === 0) {
         log.warn('⚠ 暂无可用账号，请使用以下方式添加：');
         log.warn('  方式1: 运行 npm run login 命令登录');
         log.warn('  方式2: 访问前端管理页面添加账号');
       } else {
-        log.info(`成功加载 ${poolSize} 个可用token`);
+        log.info(`成功加载 ${poolSize} 个token（启用 ${enabledCount} 个，禁用 ${poolSize - enabledCount} 个）`);
         if (this.rotationStrategyName === RotationStrategy.REQUEST_COUNT) {
           log.info(`轮询策略: ${this.rotationStrategyName}, 每token请求 ${this.requestCountPerToken} 次后切换`);
         } else {
           log.info(`轮询策略: ${this.rotationStrategyName}`);
         }
 
-        // 8. 并发刷新所有过期的 token
-        await this._refreshExpiredTokens();
+        // 8. 只刷新启用且过期的 token
+        if (enabledCount > 0) {
+          await this._refreshExpiredTokens();
+          await this._syncMissingCreditsForEnabledTokens();
+        }
       }
     } catch (error) {
       log.error('初始化token失败:', error.message);
@@ -137,6 +155,49 @@ class TokenManager {
     // 禁用失效的 tokens
     for (const { token, tokenId } of tokensToDisable) {
       await this._disableTokenInternal(tokenId);
+    }
+  }
+
+  /**
+   * 为已启用但缺少积分信息的 token 自动补拉积分
+   * @private
+   */
+  async _syncMissingCreditsForEnabledTokens() {
+    const tokenIds = this.pool.getEnabledIds().filter(tokenId => {
+      const token = this.pool.get(tokenId);
+      return token && (token.credits === null || token.credits === undefined);
+    });
+
+    if (tokenIds.length === 0) {
+      return;
+    }
+
+    log.info(`检测到 ${tokenIds.length} 个启用Token缺少积分信息，开始自动同步`);
+
+    const results = await Promise.allSettled(tokenIds.map(async (tokenId) => {
+      const token = this.pool.get(tokenId);
+      if (!token) return false;
+
+      const subscriptionInfo = await this.projectIdFetcher.fetchSubscriptionAndCredits(token);
+      if (subscriptionInfo.fetched === false) {
+        return false;
+      }
+
+      this.pool.update(tokenId, {
+        sub: subscriptionInfo.sub || 'free-tier',
+        credits: subscriptionInfo.credits ?? null
+      });
+      await this._persistToken(token);
+      return true;
+    }));
+
+    const successCount = results.filter(result => result.status === 'fulfilled' && result.value === true).length;
+    const failCount = tokenIds.length - successCount;
+
+    if (successCount > 0) {
+      log.info(`积分自动同步完成: 成功 ${successCount} 个${failCount > 0 ? `, 失败 ${failCount} 个` : ''}`);
+    } else if (failCount > 0) {
+      log.warn(`积分自动同步失败: 共 ${failCount} 个`);
     }
   }
 
@@ -329,10 +390,15 @@ class TokenManager {
     try {
       const allTokens = await this.store.readAll();
       const tokenId = await this.pool.generateTokenId(token);
+      let index = -1;
 
-      const index = allTokens.findIndex(async t =>
-        await this.pool.generateTokenId(t) === tokenId
-      );
+      for (let i = 0; i < allTokens.length; i++) {
+        const currentTokenId = await this.pool.generateTokenId(allTokens[i]);
+        if (currentTokenId === tokenId) {
+          index = i;
+          break;
+        }
+      }
 
       if (index !== -1) {
         allTokens[index] = token;
@@ -351,14 +417,20 @@ class TokenManager {
   async addToken(tokenData) {
     await this._ensureInitialized();
 
-    // 1. 获取 projectId
-    const { projectId, sub } = await this.projectIdFetcher.fetchProjectId(tokenData);
+    // 1. 获取 projectId、订阅和积分信息
+    const fetchResult = await this.projectIdFetcher.fetchProjectId(tokenData);
+    const { projectId, sub, credits } = fetchResult;
+
+    // 如果 fetchProjectId 没返回积分，尝试单独获取
+    let finalCredits = credits !== undefined ? credits : tokenData.credits;
+    if (finalCredits === undefined) finalCredits = null;
 
     // 2. 构建完整的 token 对象
     const token = {
       ...tokenData,
       projectId,
       sub,
+      credits: finalCredits,
       enable: true,
       hasQuota: true,
       sessionId: generateSessionId(),
@@ -395,9 +467,15 @@ class TokenManager {
     // 2. 持久化
     try {
       const allTokens = await this.store.readAll();
-      const index = allTokens.findIndex(async t =>
-        await this.pool.generateTokenId(t) === tokenId
-      );
+      let index = -1;
+
+      for (let i = 0; i < allTokens.length; i++) {
+        const currentTokenId = await this.pool.generateTokenId(allTokens[i]);
+        if (currentTokenId === tokenId) {
+          index = i;
+          break;
+        }
+      }
 
       if (index !== -1) {
         allTokens[index].enable = false;
@@ -565,6 +643,13 @@ class TokenManager {
     try {
       await this._ensureInitialized();
 
+      const tokenBeforeUpdate = this.pool.get(tokenId);
+      if (!tokenBeforeUpdate) {
+        return { success: false, message: 'Token不存在' };
+      }
+
+      const wasEnabled = tokenBeforeUpdate.enable !== false;
+
       // 更新池中的 token
       const success = this.pool.update(tokenId, updates);
       if (!success) {
@@ -574,6 +659,29 @@ class TokenManager {
       // 持久化
       const token = this.pool.get(tokenId);
       await this._persistToken(token);
+
+      const isEnabling = updates.enable === true && !wasEnabled;
+      if (isEnabling) {
+        let syncedCredits = false;
+
+        try {
+          if (this.lifecycle.isExpired(token)) {
+            await this.lifecycle.refreshToken(token, tokenId);
+            await this._persistToken(token);
+          }
+
+          const subscriptionInfo = await this.refreshSubscriptionAndCreditsById(tokenId);
+          syncedCredits = subscriptionInfo.fetched !== false;
+        } catch (error) {
+          log.warn(`启用Token后自动同步积分失败 (${tokenId}): ${error.message}`);
+        }
+
+        return {
+          success: true,
+          message: syncedCredits ? 'Token启用成功，积分已自动同步' : 'Token启用成功，但积分同步失败',
+          syncedCredits
+        };
+      }
 
       return { success: true, message: 'Token更新成功' };
     } catch (error) {
@@ -635,6 +743,44 @@ class TokenManager {
     return {
       expires_in: token.expires_in,
       timestamp: token.timestamp
+    };
+  }
+
+  /**
+   * 根据 tokenId 刷新订阅和积分信息
+   * @param {string} tokenId - Token ID
+   * @returns {Promise<{sub: string, credits: number|null, isActivated: boolean}>}
+   */
+  async refreshSubscriptionAndCreditsById(tokenId) {
+    await this._ensureInitialized();
+
+    const token = this.pool.get(tokenId);
+    if (!token) {
+      throw new TokenError('Token不存在', null, 404);
+    }
+
+    const subscriptionInfo = await this.projectIdFetcher.fetchSubscriptionAndCredits(token);
+    if (!subscriptionInfo.fetched) {
+      return {
+        sub: token.sub || 'free-tier',
+        credits: token.credits ?? null,
+        isActivated: false,
+        fetched: false
+      };
+    }
+
+    const updates = {
+      sub: subscriptionInfo.sub || 'free-tier',
+      credits: subscriptionInfo.credits ?? null
+    };
+
+    this.pool.update(tokenId, updates);
+    await this._persistToken(token);
+
+    return {
+      ...subscriptionInfo,
+      ...updates,
+      fetched: true
     };
   }
 

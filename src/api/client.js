@@ -142,15 +142,77 @@ registerMemoryCleanup();
 
 // ==================== 辅助函数 ====================
 
-function buildHeaders(token) {
+function buildHeaders(token, hostOverride = null) {
   return {
-    'Host': config.api.host,
+    'Host': hostOverride || config.api.host,
     'User-Agent': config.api.userAgent,
     'Transfer-Encoding': 'chunked',
     'Authorization': `Bearer ${token.access_token}`,
     'Content-Type': 'application/json',
     'Accept-Encoding': 'gzip'
   };
+}
+
+// ==================== 上游 baseURL Fallback ====================
+
+/**
+ * 判断错误是否应触发 baseURL fallback
+ * 429 不触发（交给 with429Retry 的三档处理）
+ * 403/400 不触发（权限/请求错误，换 URL 没用）
+ */
+function shouldFallback(error) {
+  // 如果已经向客户端发送过流数据，禁止 fallback（避免脏数据）
+  if (error?._skipFallback) return false;
+  const status = getUpstreamStatus(error);
+  if (status === 429) return false;
+  if (status === 403) return false;
+  if (status === 400) return false;
+  if (status === 503) return true;
+  if (status >= 500) return true;
+  // 网络错误/超时（无 status 或 fallback 默认 500）
+  const code = error?.code || error?.cause?.code;
+  const networkCodes = [
+    'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND',
+    'EAI_AGAIN', 'EPIPE', 'UND_ERR_CONNECT_TIMEOUT', 'ERR_SOCKET_CONNECTION_TIMEOUT'
+  ];
+  if (code && networkCodes.includes(code)) return true;
+  if (error?.message?.includes('timeout')) return true;
+  return false;
+}
+
+/**
+ * 带上游 baseURL fallback 的执行器
+ * 按 config.api.upstreamCandidates 顺序尝试，遇到 503/网络错误/5xx 时自动切换下一个
+ * 429/403/400 等不 fallback，直接抛出让上层处理
+ *
+ * @param {Function} fn - (candidate) => Promise，candidate 包含 { name, url, noStreamUrl, host, ... }
+ *                        candidate 为 null 时表示无候选列表，应使用默认 config
+ * @returns {Promise<any>}
+ */
+async function withUpstreamFallback(fn) {
+  const candidates = config.api.upstreamCandidates;
+  if (!candidates || candidates.length === 0) {
+    // 无候选列表，直接用默认配置执行
+    return fn(null);
+  }
+  let lastError = null;
+  for (const candidate of candidates) {
+    try {
+      return await fn(candidate);
+    } catch (error) {
+      lastError = error;
+      if (!shouldFallback(error)) {
+        throw error; // 429/403/400 等不应 fallback 的错误直接抛出
+      }
+      const status = getUpstreamStatus(error);
+      logger.warn(
+        `[upstream-fallback] ${candidate.name} 失败 (${status || 'network error'}: ${error.message?.substring(0, 100)})，` +
+        `尝试下一个上游...`
+      );
+    }
+  }
+  logger.error('[upstream-fallback] 所有上游均失败');
+  throw lastError;
 }
 
 // 统一错误处理
@@ -182,36 +244,57 @@ export async function generateAssistantResponse(requestBody, token, callback) {
   const conversationId = randomUUID();
   const messageId = randomUUID();
   const modelName = requestBody.model;
-  const headers = buildHeaders(token);
   const dumpId = isDebugDumpEnabled() ? createDumpId('stream') : null;
   const streamCollector = dumpId ? createStreamCollector() : null;
-  headers["Content-Length"] = String(Buffer.byteLength(JSON.stringify(requestBody)));
   let num = Math.floor(Math.random() * QA_PAIRS.length);
   if (dumpId) {
     await dumpFinalRequest(dumpId, requestBody);
   }
   //console.log(JSON.stringify(requestBody,null,2));
 
-  // 在 state 中临时缓存思维链签名，供流式多片段复用，并携带 session 与 model 信息以写入全局缓存
-  const state = {
-    toolCalls: [],
-    reasoningSignature: null,
-    sessionId: requestBody.request?.sessionId,
-    model: requestBody.model
-  };
-  const processor = createStreamLineProcessor({
-    state,
-    onEvent: callback,
-    onRawChunk: (chunk) => collectStreamChunk(streamCollector, chunk)
-  });
-
   try {
-    await runSseStream({
-      url: config.api.url,
-      headers,
-      body: requestBody,
-      processor,
-      onErrorChunk: (chunk) => collectStreamChunk(streamCollector, chunk)
+    // 追踪是否已经向客户端发送过流数据（用于防止 fallback 时产生脏数据）
+    let hasEmittedData = false;
+    const safeCallback = (...args) => {
+      hasEmittedData = true;
+      return callback(...args);
+    };
+
+    await withUpstreamFallback(async (candidate) => {
+      const targetUrl = candidate?.url || config.api.url;
+      const targetHost = candidate?.host || config.api.host;
+      const headers = buildHeaders(token, targetHost);
+      headers["Content-Length"] = String(Buffer.byteLength(JSON.stringify(requestBody)));
+
+      // 每次 fallback 尝试都创建新的 state/processor（避免上一次尝试的脏状态）
+      const state = {
+        toolCalls: [],
+        reasoningSignature: null,
+        sessionId: requestBody.request?.sessionId,
+        model: requestBody.model
+      };
+      const processor = createStreamLineProcessor({
+        state,
+        onEvent: safeCallback,
+        onRawChunk: (chunk) => collectStreamChunk(streamCollector, chunk)
+      });
+
+      try {
+        await runSseStream({
+          url: targetUrl,
+          headers,
+          body: requestBody,
+          processor,
+          onErrorChunk: (chunk) => collectStreamChunk(streamCollector, chunk)
+        });
+      } catch (error) {
+        try { processor.close(); } catch { }
+        // 如果已经向客户端发送过数据，不能 fallback（否则客户端收到重复/混乱的流事件）
+        if (hasEmittedData) {
+          error._skipFallback = true;
+        }
+        throw error; // 让 withUpstreamFallback 判断是否 fallback
+      }
     });
 
     // 流式响应结束后，以 JSON 格式写入日志
@@ -223,7 +306,6 @@ export async function generateAssistantResponse(requestBody, token, callback) {
     sendLog(token, num, trajectoryId, conversationId, messageId).catch(err => logger.warn('发送log失败:', err.message));
     sendCheckPoint(token).catch(err => logger.warn('发送checkPoint失败:', err.message));;
   } catch (error) {
-    try { processor.close(); } catch { }
     await handleApiError(error, token, dumpId);
   }
 }
@@ -330,21 +412,26 @@ export async function generateAssistantResponseNoStream(requestBody, token) {
   const conversationId = randomUUID();
   const messageId = randomUUID();
   const modelName = requestBody.model;
-  const headers = buildHeaders(token);
   const dumpId = isDebugDumpEnabled() ? createDumpId('no_stream') : null;
   let num = Math.floor(Math.random() * QA_PAIRS.length);
-  headers["Content-Length"] = String(Buffer.byteLength(JSON.stringify(requestBody)));
 
   if (dumpId) await dumpFinalRequest(dumpId, requestBody);
   let data;
   try {
-    data = await postJsonAndParse({
-      url: config.api.noStreamUrl,
-      headers,
-      body: requestBody,
-      dumpId,
-      dumpFinalRawResponse,
-      rawFormat: 'json'
+    data = await withUpstreamFallback(async (candidate) => {
+      const targetUrl = candidate?.noStreamUrl || config.api.noStreamUrl;
+      const targetHost = candidate?.host || config.api.host;
+      const headers = buildHeaders(token, targetHost);
+      headers["Content-Length"] = String(Buffer.byteLength(JSON.stringify(requestBody)));
+
+      return postJsonAndParse({
+        url: targetUrl,
+        headers,
+        body: requestBody,
+        dumpId,
+        dumpFinalRawResponse,
+        rawFormat: 'json'
+      });
     });
     sendRecordCodeAssistMetrics(token, trajectoryId).catch(err => logger.warn('发送RecordCodeAssistMetrics失败:', err.message));
     sendRecordTrajectoryAnalytics(token, num, trajectoryId, messageId, conversationId, modelName).catch(err => logger.warn('发送轨迹分析失败:', err.message));
